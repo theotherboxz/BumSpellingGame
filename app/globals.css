@@ -1,0 +1,14 @@
+@import "tailwindcss";
+
+@theme {
+  --color-board: #1a3a2a;
+  --color-board-bg: #0f2a1c;
+  --color-accent-green: #69f0ae;
+  --color-accent-yellow: #f9d923;
+  --color-accent-red: #e84545;
+  --color-accent-blue: #4fc3f7;
+  --color-accent-purple: #c084fc;
+
+  --font-fredoka: var(--font-fredoka);
+  --font-nunito: var(--font-nunito);
+}

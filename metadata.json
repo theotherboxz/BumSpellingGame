@@ -1,0 +1,5 @@
+{
+  "name": "Spell It!",
+  "description": "A spelling bee game with a chalkboard theme, dynamic word generation, and TTS.",
+  "requestFramePermissions": []
+}
