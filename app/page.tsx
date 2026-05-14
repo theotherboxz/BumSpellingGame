@@ -187,7 +187,8 @@ export default function SpellIt() {
   }, [fetchWords, showToast, speak]);
 
   useEffect(() => {
-    initKokoro(); // start loading voice model in background immediately
+    // Defer voice model loading to avoid synchronous setState in effect body
+    const voiceTimer = setTimeout(() => initKokoro(), 0);
 
     const checkPuter = setInterval(() => {
       if (window.puter) {
@@ -206,6 +207,7 @@ export default function SpellIt() {
     }, 5000);
 
     return () => {
+      clearTimeout(voiceTimer);
       clearInterval(checkPuter);
       clearTimeout(puterTimeout);
     };
