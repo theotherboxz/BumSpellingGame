@@ -53,8 +53,9 @@ export default function SpellIt() {
   
   const inputRef        = useRef<HTMLInputElement>(null);
   const loadTimeoutRef  = useRef<NodeJS.Timeout | null>(null);
-  const kokoroRef       = useRef<any>(null);
-  const kokoroLoadingRef = useRef<boolean>(false);
+  const kokoroRef        = useRef<any>(null);
+  const kokoroLoadingRef  = useRef<boolean>(false);
+  const audioCtxRef       = useRef<AudioContext | null>(null);
   const [voiceStatus, setVoiceStatus] = useState<'loading' | 'ready' | 'failed'>('loading');
 
   const showToast = useCallback((title: string, message: string) => {
@@ -64,7 +65,8 @@ export default function SpellIt() {
     }, 5000);
   }, []);
 
-  const fallbackSpeak = useCallback((wordToSpeak: string) => {
+  // Last-resort: browser built-in speech synthesis
+  const browserSpeak = useCallback((wordToSpeak: string) => {
     if (typeof window === 'undefined' || !('speechSynthesis' in window)) {
       setIsSpeaking(false);
       return;
@@ -81,6 +83,7 @@ export default function SpellIt() {
     window.speechSynthesis.speak(utterance);
   }, []);
 
+  // Fallback 2: Kokoro-82M (in-browser ONNX model)
   const initKokoro = useCallback(async () => {
     if (kokoroRef.current || kokoroLoadingRef.current) return;
     kokoroLoadingRef.current = true;
@@ -90,31 +93,111 @@ export default function SpellIt() {
         'onnx-community/Kokoro-82M-v1.0',
         { dtype: 'q8' }
       );
-      setVoiceStatus('ready');
     } catch (err) {
-      console.warn('Kokoro failed to load, using browser voice fallback:', err);
-      setVoiceStatus('failed');
+      console.warn('Kokoro failed to load:', err);
     }
     kokoroLoadingRef.current = false;
   }, []);
 
+  const kokoroSpeak = useCallback(async (wordToSpeak: string): Promise<boolean> => {
+    try {
+      if (!kokoroRef.current) await initKokoro();
+      if (!kokoroRef.current) return false;
+      const audio = await kokoroRef.current.generate(wordToSpeak, { voice: 'af_heart' });
+      await audio.play();
+      setIsSpeaking(false);
+      return true;
+    } catch {
+      return false;
+    }
+  }, [initKokoro]);
+
+  // Play a raw audio Blob/ArrayBuffer via Web Audio API
+  const playAudioBlob = useCallback(async (blob: Blob): Promise<void> => {
+    const arrayBuffer = await blob.arrayBuffer();
+    if (!audioCtxRef.current) {
+      audioCtxRef.current = new AudioContext();
+    }
+    const ctx = audioCtxRef.current;
+    if (ctx.state === 'suspended') await ctx.resume();
+    const decoded = await ctx.decodeAudioData(arrayBuffer);
+    const source = ctx.createBufferSource();
+    source.buffer = decoded;
+    source.connect(ctx.destination);
+    return new Promise((resolve) => {
+      source.onended = () => resolve();
+      source.start();
+    });
+  }, []);
+
+  // Primary: Chatterbox by Resemble AI (currently #1 trending TTS on Hugging Face)
+  // Fallback 1: Meta MMS TTS (facebook/mms-tts-eng) – one of the most downloaded TTS on HF
+  const hfSpeak = useCallback(async (wordToSpeak: string): Promise<boolean> => {
+    try {
+      const { HfInference } = await import('@huggingface/inference');
+      const hf = new HfInference(); // uses free-tier serverless inference
+
+      // Try Chatterbox first (most popular & natural sounding)
+      try {
+        const blob = await hf.textToSpeech({
+          model: 'resemble-ai/chatterbox',
+          inputs: wordToSpeak,
+        });
+        await playAudioBlob(blob);
+        setVoiceStatus('ready');
+        setIsSpeaking(false);
+        return true;
+      } catch (chatterboxErr) {
+        console.warn('Chatterbox unavailable, trying MMS:', chatterboxErr);
+      }
+
+      // Try Meta MMS (facebook/mms-tts-eng) as secondary HF option
+      const blob = await hf.textToSpeech({
+        model: 'facebook/mms-tts-eng',
+        inputs: wordToSpeak,
+      });
+      await playAudioBlob(blob);
+      setVoiceStatus('ready');
+      setIsSpeaking(false);
+      return true;
+    } catch (err) {
+      console.warn('HF Inference TTS failed:', err);
+      return false;
+    }
+  }, [playAudioBlob]);
+
+  // Kick off HF voice check on mount
+  const initHfVoice = useCallback(async () => {
+    setVoiceStatus('loading');
+    // Warm up Kokoro in parallel so it's ready as fallback
+    initKokoro();
+    // Probe HF with a silent test to set status
+    try {
+      const { HfInference } = await import('@huggingface/inference');
+      const hf = new HfInference();
+      await hf.textToSpeech({ model: 'facebook/mms-tts-eng', inputs: 'test' });
+      setVoiceStatus('ready');
+    } catch {
+      setVoiceStatus('failed');
+    }
+  }, [initKokoro]);
+
   const speak = useCallback(async (wordToSpeak: string) => {
     if (isSpeaking) return;
     setIsSpeaking(true);
-    try {
-      if (!kokoroRef.current) await initKokoro();
-      if (kokoroRef.current) {
-        const audio = await kokoroRef.current.generate(wordToSpeak, { voice: 'af_heart' });
-        await audio.play();
-        setIsSpeaking(false);
-      } else {
-        throw new Error('Kokoro not available');
-      }
-    } catch (err) {
-      console.warn('Kokoro speak failed, using browser fallback:', err);
-      fallbackSpeak(wordToSpeak);
-    }
-  }, [isSpeaking, initKokoro, fallbackSpeak]);
+
+    // 1. Try Hugging Face (Chatterbox → MMS)
+    const hfOk = await hfSpeak(wordToSpeak);
+    if (hfOk) return;
+
+    // 2. Try in-browser Kokoro-82M
+    const kokoroOk = await kokoroSpeak(wordToSpeak);
+    if (kokoroOk) return;
+
+    // 3. Final fallback: browser speech synthesis
+    setVoiceStatus('failed');
+    browserSpeak(wordToSpeak);
+  }, [isSpeaking, hfSpeak, kokoroSpeak, browserSpeak]);
 
   const fetchWords = useCallback(async (diff: 'Easy' | 'Normal' | 'Hard', excludeSet: Set<string>): Promise<string[]> => {
     try {
@@ -188,7 +271,7 @@ export default function SpellIt() {
 
   useEffect(() => {
     // Defer voice model loading to avoid synchronous setState in effect body
-    const voiceTimer = setTimeout(() => initKokoro(), 0);
+    const voiceTimer = setTimeout(() => initHfVoice(), 0);
 
     const checkPuter = setInterval(() => {
       if (window.puter) {
@@ -374,7 +457,7 @@ export default function SpellIt() {
         <div className="h-16 md:h-20 shrink-0 flex items-center justify-between px-4 md:px-8 bg-[#152e22] border-b border-white/10 relative z-10 font-bold">
           <div className="hidden md:flex gap-2">
             <span className="px-3 py-1 bg-[#4fc3f7]/20 text-[#4fc3f7] text-[10px] uppercase tracking-widest rounded border border-[#4fc3f7]/30 flex items-center gap-1"><FastForward className="w-3 h-3"/> Puter AI Words</span>
-            <span className={`px-3 py-1 text-[10px] uppercase tracking-widest rounded border flex items-center gap-1 transition-colors ${ voiceStatus === 'ready' ? 'bg-[#69f0ae]/20 text-[#69f0ae] border-[#69f0ae]/30' : voiceStatus === 'failed' ? 'bg-[#f9d923]/20 text-[#f9d923] border-[#f9d923]/30' : 'bg-white/10 text-white/50 border-white/20'}`}><Volume2 className={`w-3 h-3 ${voiceStatus === 'loading' ? 'animate-pulse' : ''}`}/>{voiceStatus === 'ready' ? 'Kokoro Voice' : voiceStatus === 'failed' ? 'Browser Voice' : 'Loading Voice...'}</span>
+            <span className={`px-3 py-1 text-[10px] uppercase tracking-widest rounded border flex items-center gap-1 transition-colors ${ voiceStatus === 'ready' ? 'bg-[#69f0ae]/20 text-[#69f0ae] border-[#69f0ae]/30' : voiceStatus === 'failed' ? 'bg-[#f9d923]/20 text-[#f9d923] border-[#f9d923]/30' : 'bg-white/10 text-white/50 border-white/20'}`}><Volume2 className={`w-3 h-3 ${voiceStatus === 'loading' ? 'animate-pulse' : ''}`}/>{voiceStatus === 'ready' ? 'Chatterbox AI Voice' : voiceStatus === 'failed' ? 'Kokoro Voice' : 'Loading Voice...'}</span>
             <span className="px-3 py-1 bg-[#c084fc]/20 text-[#c084fc] text-[10px] uppercase tracking-widest rounded border border-[#c084fc]/30 flex items-center gap-1"><HelpCircle className="w-3 h-3"/> Puter Definitions</span>
           </div>
           <div className="flex gap-2 md:hidden">
@@ -603,4 +686,4 @@ export default function SpellIt() {
       </AnimatePresence>
     </div>
   );
-                                                                           }
+}
